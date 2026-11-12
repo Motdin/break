@@ -3,16 +3,13 @@ import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
 import numpy as np
 import time
+import os
 import sys
 import argparse
-import math
-
-BIGINT_WORDS = 8
 
 def int_to_bigint_np(val):
-    bigint_arr = np.zeros(BIGINT_WORDS, dtype=np.uint32)
-    for j in range(BIGINT_WORDS):
-        bigint_arr[j] = (val >> (32 * j)) & 0xFFFFFFFF
+    bigint_arr = np.zeros(8, dtype=np.uint32)
+    for j in range(8): bigint_arr[j] = (val >> (32 * j)) & 0xFFFFFFFF
     return bigint_arr
 
 def load_target_h160_bin(filename):
@@ -29,143 +26,147 @@ def init_secp256k1_constants(mod):
     p_data=np.array([0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF],dtype=np.uint32);const_p_gpu=mod.get_global("const_p")[0];cuda.memcpy_htod(const_p_gpu,p_data)
     n_data=np.array([0xD0364141,0xBFD25E8C,0xAF48A03B,0xBAAEDCE6,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF],dtype=np.uint32);const_n_gpu=mod.get_global("const_n")[0];cuda.memcpy_htod(const_n_gpu,n_data)
     g_x=np.array([0x16F81798,0x59F2815B,0x2DCE28D9,0x029BFCDB,0xCE870B07,0x55A06295,0xF9DCBBAC,0x79BE667E],dtype=np.uint32);g_y=np.array([0xFB10D4B8,0x9C47D08F,0xA6855419,0xFD17B448,0x0E1108A8,0x5DA4FBFC,0x26A3C465,0x483ADA77],dtype=np.uint32);g_z=np.array([1,0,0,0,0,0,0,0],dtype=np.uint32);g_infinity=np.array([False],dtype=np.bool_)
-    ecpoint_jac_dtype=np.dtype([('X',np.uint32,BIGINT_WORDS),('Y',np.uint32,BIGINT_WORDS),('Z',np.uint32,BIGINT_WORDS),('infinity',np.bool_)])
-    g_jac=np.zeros(1,dtype=ecpoint_jac_dtype)
+    ecpoint_jac_dtype=np.dtype([('X',np.uint32,8),('Y',np.uint32,8),('Z',np.uint32,8),('infinity',np.bool_)]);g_jac=np.zeros(1,dtype=ecpoint_jac_dtype)
     g_jac['X'],g_jac['Y'],g_jac['Z'],g_jac['infinity']=g_x,g_y,g_z,g_infinity
     const_G_gpu=mod.get_global("const_G_jacobian")[0];cuda.memcpy_htod(const_G_gpu, g_jac)
 
+# Fungsi baru untuk menjalankan precomputation
 def run_precomputation(mod):
     precompute_kernel = mod.get_function("precompute_G_table_kernel")
-    precompute_kernel(block=(1,1,1))
+    precompute_kernel(block=(1, 1, 1))
     cuda.Context.synchronize()
+    print("[*] Precomputation table selesai.")
 
-def words32_to_hex(words):
-    res = 0
-    for i in range(len(words)-1, -1, -1):
-        res = (res << 32) | int(words[i])
-    return f"{res:064x}"
-
-def format_rate(keys, seconds):
-    if seconds <= 0: return "0 k/s"
-    kps = keys/seconds
-    if kps >= 1e6: return f"{kps/1e6:,.2f} M/s"
-    if kps >= 1e3: return f"{kps/1e3:,.2f} k/s"
-    return f"{kps:,.2f} /s"
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--start', type=lambda x: int(x,0), required=True)
-    parser.add_argument('--end', type=lambda x: int(x,0), required=True)
-    parser.add_argument('--step', type=lambda x: int(x,0), default=1)
-    parser.add_argument('--file', default='target.txt')
-    parser.add_argument('--keys-per-launch', type=int, default=1<<22)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Full CUDA HASH160 Brute Forcer with Sliding Window')
+    parser.add_argument('--start', type=lambda x: int(x, 0), required=True, help='Kunci privat awal')
+    parser.add_argument('--end', type=lambda x: int(x, 0), required=True, help='Kunci privat akhir')
+    parser.add_argument('--step', type=lambda x: int(x, 0), default=1, help='Langkah penambahan')
+    parser.add_argument('--file', default='target.txt', help='File target HASH160')
+    parser.add_argument('--keys-per-launch', type=int, default=2**24, help='Jumlah kunci per batch GPU (default: 16,777,216)')
     args = parser.parse_args()
 
+    # Inisialisasi di luar loop
+    print("[*] Memuat file kernel CUDA tunggal...")
     try:
-        with open('kernel160.cu','r') as f:
+        with open('kernel160.cu', 'r') as f:
             full_cuda_code = f.read()
     except FileNotFoundError:
-        print("kernel160.cu not found"); sys.exit(1)
+        print("[!] FATAL: File 'kernel.cu' tidak ditemukan.")
+        sys.exit(1)
 
-    mod = SourceModule(full_cuda_code, no_extern_c=False, options=['-std=c++11','-arch=sm_75','-O3'])
+    print("[*] Mengkompilasi kernel Full CUDA...")
+    # Tambahkan arch specification untuk Tesla T4 (sm_75)
+    mod = SourceModule(full_cuda_code, no_extern_c=False, options=['-std=c++11', '-arch=sm_75'])
     init_secp256k1_constants(mod)
+
+    # Jalankan precomputation sebelum kernel utama
+    print("[*] Menjalankan precomputation...")
     run_precomputation(mod)
 
+    # Gunakan kernel yang dioptimalkan dengan precomputation
     find_hash_kernel = mod.get_function("find_hash_kernel_optimized")
+    print("[*] Inisialisasi selesai.")
 
     target_bin = load_target_h160_bin(args.file)
     num_targets = len(target_bin) // 20
     if num_targets == 0:
-        print("no targets"); sys.exit(1)
+        print(f"[!] Tidak ada HASH160 valid di {args.file}."); sys.exit(1)
 
-    pinned_targets = cuda.pagelocked_empty(len(target_bin), dtype=np.uint8)
-    pinned_targets[:] = np.frombuffer(target_bin, dtype=np.uint8)
-    d_targets = cuda.mem_alloc(pinned_targets.nbytes)
-    cuda.memcpy_htod(d_targets, pinned_targets)
+    print(f"[*] Berhasil memuat {num_targets} HASH160 target.")
+    d_targets = cuda.mem_alloc(len(target_bin))
+    cuda.memcpy_htod(d_targets, np.frombuffer(target_bin, dtype=np.uint8))
 
-    d_result = cuda.mem_alloc(32)
-    d_found_flag = cuda.mem_alloc(4)
-    cuda.memset_d32(d_result, 0, 8)
-    cuda.memset_d32(d_found_flag, 0, 1)
+    d_result = cuda.mem_alloc(32); d_found_flag = cuda.mem_alloc(4)
+    cuda.memset_d32(d_result, 0, 8); cuda.memset_d32(d_found_flag, 0, 1)
 
-    found_flag_host = cuda.pagelocked_empty(1, dtype=np.int32)
-    found_flag_host[0] = 0
-    result_host = cuda.pagelocked_empty(8, dtype=np.uint32)
-
-    streams = [cuda.Stream() for _ in range(2)]
-
+    # Inisialisasi untuk loop
     total_keys_checked = 0
     start_time = time.time()
+    iteration = 0
     current_start = args.start
     current_end = args.end
-    step_np = int_to_bigint_np(args.step)
-    step_buf = cuda.mem_alloc(step_np.nbytes)
-    cuda.memcpy_htod(step_buf, step_np)
+    found_flag_host = np.zeros(1, dtype=np.int32)
 
-    block_size = 256
-    last_total = 0
-
+    # =======================================================
+    # MODIFIKASI: SLIDING WINDOW DENGAN MENGURANGI START DAN END
+    # =======================================================
     try:
-        while found_flag_host[0] == 0 and current_start <= current_end:
-            keys_left = (current_end - current_start) // args.step + 1
-            keys_this_launch = min(args.keys_per_launch, keys_left)
-            if keys_this_launch <= 0: break
-            grid_size = (keys_this_launch + block_size - 1) // block_size
-            start_key_np = int_to_bigint_np(current_start)
-            if 'd_start' in locals(): d_start.free()
-            d_start = cuda.mem_alloc(start_key_np.nbytes)
-            cuda.memcpy_htod(d_start, start_key_np)
-            s = streams[total_keys_checked % len(streams)]
+        while found_flag_host[0] == 0 and current_end >= 0:
+            print(f"\n[+] Iterasi {iteration}: Rentang {hex(current_start)} - {hex(current_end)} (Size: {(current_end - current_start)//args.step + 1:,} keys)")
 
-            found_flag_host[0] = 0
-            cuda.memcpy_htod_async(d_found_flag, found_flag_host, stream=s)
+            temp_current = current_start
+            keys_in_window = (current_end - current_start) // args.step + 1
+            keys_processed_in_window = 0
 
-            evt_start = cuda.Event()
-            evt_after_kernel = cuda.Event()
-            evt_after_copy = cuda.Event()
-            evt_start.record(stream=s)
+            # Loop dalam untuk memindai seluruh rentang saat ini
+            while temp_current <= current_end and found_flag_host[0] == 0:
+                keys_left = (current_end - temp_current) // args.step + 1
+                keys_this_launch = min(args.keys_per_launch, keys_left)
+                if keys_this_launch <= 0: break
 
-            find_hash_kernel(d_start, np.uint64(keys_this_launch), step_buf, d_targets, np.int32(num_targets), d_result, d_found_flag, block=(block_size,1,1), grid=(grid_size,1,1), stream=s)
+                start_key_np = int_to_bigint_np(temp_current)
+                step_np = int_to_bigint_np(args.step)
 
-            evt_after_kernel.record(stream=s)
-            cuda.memcpy_dtoh_async(found_flag_host, d_found_flag, stream=s)
-            evt_after_copy.record(stream=s)
-            s.synchronize()
+                block_size = 256
+                grid_size = (keys_this_launch + block_size - 1) // block_size
 
-            t_kernel = evt_start.time_till(evt_after_kernel) / 1000.0 if evt_start and evt_after_kernel else 0.0
-            t_copy = evt_after_kernel.time_till(evt_after_copy) / 1000.0 if evt_after_kernel and evt_after_copy else 0.0
-            t_batch = t_kernel + t_copy
-            total_keys_checked += keys_this_launch
-            elapsed = time.time() - start_time
-            batch_keys = total_keys_checked - last_total
-            last_total = total_keys_checked
+                # Luncurkan kernel yang dioptimalkan
+                find_hash_kernel(
+                    cuda.In(start_key_np), np.uint64(keys_this_launch), cuda.In(step_np),
+                    d_targets, np.int32(num_targets),
+                    d_result, d_found_flag,
+                    block=(block_size, 1, 1), grid=(grid_size, 1)
+                )
+                cuda.Context.synchronize()
 
-            free_mem, total_mem = cuda.mem_get_info()
-            eta = (current_end - current_start) / (total_keys_checked / elapsed) if total_keys_checked>0 else float('inf')
+                total_keys_checked += keys_this_launch
+                keys_processed_in_window += keys_this_launch
 
-            line = (
-                f"Total:{total_keys_checked:,} | "
-                f"Elapsed:{int(elapsed)}s | "
-                f"Rate:{format_rate(total_keys_checked, elapsed)} | "
-                f"Batch:{batch_keys:,} keys in {t_batch:.3f}s (kernel {t_kernel:.3f}s copy {t_copy:.3f}s) | "
-                f"FreeMem:{int(free_mem/1024/1024):,}MB/{int(total_mem/1024/1024):,}MB | "
-                f"ETA:{'inf' if eta==float('inf') else f'{int(eta)}s'}"
-            )
-            sys.stdout.write("\r" + line + " " * 10)
-            sys.stdout.flush()
+                # Periksa hasil
+                cuda.memcpy_dtoh(found_flag_host, d_found_flag)
 
-            if found_flag_host[0] != 0:
-                cuda.memcpy_dtoh(result_host, d_result)
-                priv_hex = words32_to_hex(result_host)
-                print("\nFOUND privkey:", priv_hex)
+                elapsed = time.time() - start_time
+                speed = total_keys_checked / elapsed if elapsed > 0 else 0
+                window_progress = 100 * keys_processed_in_window / keys_in_window
+                progress_str = f"[+] Total: {total_keys_checked:,} | Kecepatan: {speed:,.2f} k/s | Window: {window_progress:.1f}% | Kunci: {hex(temp_current)}"
+                sys.stdout.write('\r' + progress_str.ljust(120)); sys.stdout.flush()
+
+                temp_current += keys_this_launch * args.step
+
+            # Geser window ke bawah (kurangi start dan end)
+            current_start -= 1
+            current_end -= 1
+            iteration += 1
+
+
+            # Hentikan jika mencapai batas bawah
+            if current_end < 0:
+                print("\n[!] Batas bawah tercapai (kunci negatif)")
                 break
 
-            current_start += keys_this_launch * args.step
+        # Setelah loop selesai, cetak hasilnya
+        if found_flag_host[0] == 1:
+            sys.stdout.write('\n'); sys.stdout.flush()
+            print("\n[+] KUNCI PRIVAT DITEMUKAN!")
+            found_privkey_np = np.zeros(8, dtype=np.uint32)
+            cuda.memcpy_dtoh(found_privkey_np, d_result)
+
+            privkey_int = 0
+            for j in range(8): privkey_int |= int(found_privkey_np[j]) << (32 * j)
+
+            print(f"    Kunci Privat: {hex(privkey_int)}")
+            print(f"    Rentang ditemukan: {hex(current_start+1)} - {hex(current_end+1)} (Iterasi {iteration-1})")
+            with open("found.txt", "a") as f:
+                f.write(f"Kunci Privat: {hex(privkey_int)}\n")
+                f.write(f"Rentang: {hex(current_start+1)} - {hex(current_end+1)}\n")
+        else:
+            print("\n\n[+] Pencarian selesai. Tidak ada yang cocok ditemukan.")
+            print(f"    Total kunci dicoba: {total_keys_checked:,}")
+            print(f"    Rentang terakhir: {hex(current_start+1)} - {hex(current_end+1)}")
+
     except KeyboardInterrupt:
-        pass
-
-    print()
-
-if __name__ == '__main__':
-    main()
-  
+        print("\n\n[!] Dihentikan oleh pengguna")
+        print(f"    Iterasi terakhir: {iteration} | Rentang: {hex(current_start)} - {hex(current_end)}")
+        print(f"    Total kunci dicoba: {total_keys_checked:,}")
+        sys.exit(0)
